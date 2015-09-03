@@ -20,67 +20,167 @@
 
 #include "memcpy_afu.h"
 
-#define CACHELINESIZE	128
-
-#define QUEUE_SIZE	4095*CACHELINESIZE
-
-/* Per process slave context */
-struct cxl_afu_h * afu_h;
 /* afu work element queue */
 struct memcpy_weq weq;
 
-/*
-* Sets up master AFU context. Specifically configuring the 
-* afu continue polling for new commands even when it doesnt
-* finds a valid command in the context.
-*/
-int setup_afu_master_psa(struct cxl_afu_h * afu)
+/* Per process slave context */
+struct cxl_afu_h * afu_h;
+
+/* Ask afu to perform a strcpy operation and wait for the operation to finish */
+int afu_memcpy(char * dst, char *src, size_t size);
+
+/* Ask afu to perform a strcpy operation and wait for an event from the afu to finish */
+int afu_memcpy2(char * dst, char *src, size_t size);
+
+/* Code entry point */
+int main(int argc, char *argv[])
 {
-	struct cxl_afu_h *afu_master_h;
-	struct memcpy_weq weq;
-	__be64 reg_data;
+	/* Sets up per process problem state area */
+	int setup_afu_slave_psa(struct cxl_afu_h * afu);
 
-	/* now that the AFU is started, lets set config options */
-	afu_master_h = cxl_afu_open_h(afu, CXL_VIEW_MASTER);
-	if (afu_master_h == NULL) {
-		perror("Unable to open AFU Master cxl device");
-		return 1;
+	struct cxl_adapter_h * adapter = NULL;
+	struct cxl_afu_h * afu = NULL;
+	char srcbuffer[1024] , dstbuffer[1024];
+	int rc = 1;
+
+	/* ************* Adapter Discovery Phase ********** */
+
+	/* Lookup if we have an capi adapter */
+	if ((adapter = cxl_adapter_next(NULL)) == NULL) {
+		warnx("No capi adapter found !!!");
+		goto out;
+	} else {
+		printf("INFO: Using CXL adapter %s\n", cxl_adapter_dev_name(adapter));
 	}
 
-	/* need a dummy work element queue to get things going */
-	memcpy_init_weq(&weq, 0);
-
-	if (cxl_afu_attach(afu_master_h,
-			   MEMCPY_WED(weq.queue, QUEUE_SIZE/CACHELINESIZE))) {
-		perror("cxl_afu_attach (master)");
-		return 1;
-	}
-	if (cxl_mmio_map(afu_master_h, CXL_MMIO_BIG_ENDIAN) == -1) {
-		perror("Unable to map AFU Master problem state registers");
-		return 1;
-	}
-	/* Clear Bit 2 to stop AFU on Invalid Command */
-	if (cxl_mmio_read64(afu_master_h, MEMCPY_AFU_PSA_REG_CTL, &reg_data) == -1) {
-		perror("mmio read fail");
-		return 1;
+	/* ************* Accelerator Discovery Phase ********** */
+	/* Lookup if we have an afu configured */
+	if ((afu = cxl_adapter_afu_next(adapter, NULL)) == NULL) {
+		warnx("No afu on the adapter found !!!");
+		goto out;
+	} else {
+		printf("INFO: Using AFU %s\n", cxl_afu_dev_name(afu));
 	}
 
-	reg_data = reg_data & ~(0x2000000000000000);
-	if (cxl_mmio_write64(afu_master_h, MEMCPY_AFU_PSA_REG_CTL, reg_data) == -1) {
-		perror("mmio write fail");
-		return 1;
+	/* ********************* Setup Phase ******************* */
+	/* Setup the slave afu context */
+	if (setup_afu_slave_psa(afu)) {
+		perror("Unable to setup slave psa");
+		goto out;
 	}
-	cxl_afu_free(afu_master_h);
 
-	return 0;
+	/* *************** Computation Phase ***************** */
+	/* All set now perform memcpy using a poll loop */
+	strcpy(srcbuffer, "Hello CAPI");
+	printf("INFO: Copying string 'Hello CAPI' to dest buffer using poll loop\n");
+	rc = afu_memcpy(dstbuffer, srcbuffer, strlen(srcbuffer) + 1);
+	if (rc) {
+		perror("Unable to perform memcpy");
+		goto out;
+	}
+	/* compare the strings */
+	rc = strcmp(srcbuffer, dstbuffer);
+	assert (rc == 0);
+	printf(">> %s\n", dstbuffer);
 
+	/* Now perform memcpy using read event */
+	dstbuffer[0] = 0;
+	printf("INFO: Copying string 'Hello CAPI' to dest buffer using read-event wait\n");
+	rc = afu_memcpy2(dstbuffer, srcbuffer, strlen(srcbuffer) + 1);
+	if (rc) {
+		perror("Unable to perform memcpy");
+		goto out;
+	}
+	/* compare the strings */
+	rc = strcmp(srcbuffer, dstbuffer);
+	assert (rc == 0);
+	printf(">> %s\n", dstbuffer);
+
+out:
+	/* ********** Deinitialization Phase ************ */
+	if (afu_h)
+		cxl_afu_free(afu_h);
+	if (afu)
+		cxl_afu_free(afu);
+	if (adapter)
+		cxl_adapter_free(adapter);
+
+ 	return rc;
 }
 
+/* Ask afu to perform a strcpy operation and wait for the operation to finish */
+int afu_memcpy(char * dst, char *src, size_t size)
+{
+	struct memcpy_work_element memcpy_we, *queued_we;
+	int ret = 0;
+
+	/* Setup a work element in the queue */
+	memcpy_we.cmd = MEMCPY_WE_CMD(0, MEMCPY_WE_CMD_COPY);
+	memcpy_we.status = 0;
+	memcpy_we.length = htobe16((uint16_t)size);
+	memcpy_we.src = htobe64((uintptr_t)src);
+	memcpy_we.dst = htobe64((uintptr_t)dst);
+
+	queued_we = memcpy_add_we(&weq, memcpy_we);
+	queued_we->cmd |= MEMCPY_WE_CMD_VALID;
+
+	/* restart the slice */
+	cxl_mmio_write64(afu_h, MEMCPY_PS_REG_PCTRL,
+			 0x8000000000000000ULL);
+
+	/* We poll the status of the work element */
+	while(!(queued_we->status & MEMCPY_WE_STAT_COMPLETE))
+		sleep(1);
+
+	return ret;
+}
+
+/* Ask afu to perform a strcpy operation and wait for an event from the afu to finish */
+int afu_memcpy2(char * dst, char *src, size_t size)
+{
+	struct memcpy_work_element memcpy_we, irq_we, *queued_we;
+	struct cxl_event event;
+	int ret = 0;
+
+	/* Setup a work element in the queue */
+	memcpy_we.cmd = MEMCPY_WE_CMD(0, MEMCPY_WE_CMD_COPY);
+	memcpy_we.status = 0;
+	memcpy_we.length = htobe16((uint16_t)size);
+	memcpy_we.src = htobe64((uintptr_t)src);
+	memcpy_we.dst = htobe64((uintptr_t)dst);
+
+	/* Setup the interrupt work element */
+	irq_we.cmd = MEMCPY_WE_CMD(1, MEMCPY_WE_CMD_IRQ);
+	irq_we.status = 0;
+	irq_we.length = 3; /* Interrupt notification when the job finishes */
+	irq_we.src = 0;
+	irq_we.dst = 0;
+
+	/* Add the primary work to the queue */
+	queued_we = memcpy_add_we(&weq, memcpy_we);
+	queued_we->cmd |= MEMCPY_WE_CMD_VALID;
+
+	/* Add the interrupt work element to the queue */
+	queued_we = memcpy_add_we(&weq, irq_we);
+	queued_we->cmd |= MEMCPY_WE_CMD_VALID;
+
+
+	/* restart the slice */
+	cxl_mmio_write64(afu_h, MEMCPY_PS_REG_PCTRL,
+			 0x8000000000000000ULL);
+
+	/* Wait for an event from the afu */
+	ret = cxl_read_expected_event(afu_h, &event, CXL_EVENT_AFU_INTERRUPT, 3);
+	return ret;
+}
+
+
+#define CACHELINESIZE	128
+#define QUEUE_SIZE	2
 /*
  * Sets up the afu per process context. This allocates the work 
  * element queue and validates if the process element is valid.
  */
-
 int setup_afu_slave_psa(struct cxl_afu_h * afu)
 {
 
@@ -95,10 +195,10 @@ int setup_afu_slave_psa(struct cxl_afu_h * afu)
 	}
 
 	/* initialize the work queue */
-	memcpy_init_weq(&weq, QUEUE_SIZE);
+	memcpy_init_weq(&weq, QUEUE_SIZE * CACHELINESIZE);
 
 	/* Point the work element descriptor (wed) at the weq */
-	wed = MEMCPY_WED(weq.queue, QUEUE_SIZE/CACHELINESIZE);
+	wed = MEMCPY_WED(weq.queue, QUEUE_SIZE);
 
 	/* attach the wed to the context */
 	ret = cxl_afu_attach(afu_h, wed);
@@ -140,99 +240,3 @@ int setup_afu_slave_psa(struct cxl_afu_h * afu)
 	return 0;
 }
 
-/* Ask afu to perform a strcpy operation and wait for the operation to finish */
-int afu_memcpy(char * dst, char *src, size_t size)
-{
-	struct memcpy_work_element memcpy_we, irq_we, *queued_we;
-	struct cxl_event event;
-	int ret = 0;
-
-	/* Setup a work element in the queue */
-	memcpy_we.cmd = MEMCPY_WE_CMD(0, MEMCPY_WE_CMD_COPY);
-	memcpy_we.status = 0;
-	memcpy_we.length = htobe16((uint16_t)size);
-	memcpy_we.src = htobe64((uintptr_t)src);
-	memcpy_we.dst = htobe64((uintptr_t)dst);
-
-	/* Setup the interrupt work element */
-	irq_we.cmd = MEMCPY_WE_CMD(1, MEMCPY_WE_CMD_IRQ);
-	irq_we.status = 0;
-	irq_we.length = 3; /* Interrupt notification when the job finishes */
-	irq_we.src = 0;
-	irq_we.dst = 0;
-
-	queued_we = memcpy_add_we(&weq, memcpy_we);
-	memcpy_add_we(&weq, irq_we);
-	queued_we->cmd |= MEMCPY_WE_CMD_VALID;
-
-	/* restart the slice */
-	cxl_mmio_write64(afu_h, MEMCPY_PS_REG_PCTRL,
-			 0x8000000000000000ULL);
-
-	/* If we want we can poll the status of the work element */
-	/* while(!(queued_we->status & MEMCPY_WE_STAT_COMPLETE)) */
-	/* 	sleep(1); */
-
-	ret = cxl_read_expected_event(afu_h, &event, CXL_EVENT_AFU_INTERRUPT, 3);
-	return ret;
-}
-
-
-/* Code entry point */
-int main(int argc, char *argv[])
-{
-	struct cxl_adapter_h * adapter = NULL;
-	struct cxl_afu_h * afu = NULL;
-	char srcbuffer[1024] , dstbuffer[1024];
-	int rc = 1;
-
-	/* Lookup if we have an capi adapter */
-	if ((adapter = cxl_adapter_next(NULL)) == NULL) {
-		warnx("No capi adapter found !!!");
-		goto out;
-	} else {
-		printf("Using CXL adapter %s\n", cxl_adapter_dev_name(adapter));
-	}
-
-	/* Lookup if we have an afu configured */
-	if ((afu = cxl_adapter_afu_next(adapter, NULL)) == NULL) {
-		warnx("No afu on the adapter found !!!");
-		goto out;
-	} else {
-		printf("Using AFU %s\n", cxl_afu_dev_name(afu));
-	}
-
-	/* Setup the master afu context */
-	if (setup_afu_master_psa(afu)) {
-		perror("Unable to setup master psa");
-		goto out;
-	}
-
-	/* Setup the master afu context */
-	if (setup_afu_slave_psa(afu)) {
-		perror("Unable to setup slave psa");
-		goto out;
-	}
-
-	/* All set now perform memcpy */
-	strcpy(srcbuffer, "Hello CAPI");
-	rc = afu_memcpy(dstbuffer, srcbuffer, strlen(srcbuffer) + 1);
-	if (rc) {
-		perror("Unable to perform memcpy");
-		goto out;
-	}
-	/* compare the strings */
-	rc = strcmp(srcbuffer, dstbuffer);
-	assert (rc == 0);
-	printf("\n>> %s\n", dstbuffer);
-
-out:
-	if (afu_h)
-		cxl_afu_free(afu_h);
-	if (afu)
-		cxl_afu_free(afu);
-	if (adapter)
-		cxl_adapter_free(adapter);
-
- 	return rc;
-}
