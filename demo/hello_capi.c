@@ -152,7 +152,7 @@ int afu_memcpy2(char * dst, char *src, size_t size)
 	/* Setup the interrupt work element */
 	irq_we.cmd = MEMCPY_WE_CMD(1, MEMCPY_WE_CMD_IRQ);
 	irq_we.status = 0;
-	irq_we.length = 3; /* Interrupt notification when the job finishes */
+	irq_we.length = htobe16(3); /* Interrupt notification when the job finishes */
 	irq_we.src = 0;
 	irq_we.dst = 0;
 
